@@ -53,6 +53,8 @@ void InternalResourceGroup::initCpu()
     cpu = cgroup_manager.createCpu(name, cpu_shares);
     if (!cpu)
         return;
+
+    //Comment: 此处初始化的thread_pool会在ThreadFromGlobalPool的构造函数中通过getThreadPool获取
     thread_pool = std::make_shared<FreeThreadPool>(10000, 500, 10000, true, nullptr, cpu);
 }
 

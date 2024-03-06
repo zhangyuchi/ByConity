@@ -430,6 +430,7 @@ FreeThreadPool & ThreadFromGlobalPool::getThreadPool()
     if (!query_context)
         return GlobalThreadPool::instance();
 
+    //Comment:是否可以有多个资源组？控制读写等不同操作
     if (auto * resource_group = query_context->tryGetResourceGroup();
         resource_group == nullptr
         || resource_group->getType() != DB::ResourceGroupType::Internal

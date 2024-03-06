@@ -197,6 +197,7 @@ public:
         cv(std::make_shared<std::condition_variable>())
     {
         /// NOTE: If this will throw an exception, the destructor won't be called.
+        //Comment: 此处getThreadPool()的调用也可以传入名称，获取不同用途的线程池？
         getThreadPool().scheduleOrThrow([
             tid = tid,
             cv = cv,
