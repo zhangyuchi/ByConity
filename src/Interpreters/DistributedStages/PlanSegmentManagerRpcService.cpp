@@ -102,6 +102,11 @@ void PlanSegmentManagerRpcService::executeQuery(
             request->password(),
             static_cast<UInt16>(request->current_exchange_port())};
         execution_info.parallel_id = request->parallel_id();
+        if (request->has_source_task_index() && request->has_source_task_count())
+        {
+            execution_info.source_task_index = request->source_task_index();
+            execution_info.source_task_count = request->source_task_count();
+        }
         query_context->setPlanSegmentInstanceId(PlanSegmentInstanceId{request->plan_segment_id(), request->parallel_id()});
         /// Set client info.
         ClientInfo & client_info = query_context->getClientInfo();
@@ -270,6 +275,14 @@ void PlanSegmentManagerRpcService::sendPlanSegmentStatus(
             request->message(),
             request->code()};
         SegmentSchedulerPtr scheduler = context->getSegmentScheduler();
+        /// if retry is successful, this status is not used anymore
+        auto bsp_scheduler = scheduler->getBSPScheduler(request->query_id());
+        if (bsp_scheduler && !status.is_succeed && !status.is_cancelled)
+        {
+            bsp_scheduler->updateSegmentStatusCounter(request->segment_id(), request->parallel_index(), status);
+            if (bsp_scheduler->retryTaskIfPossible(request->segment_id(), request->parallel_index()))
+                return;
+        }
         scheduler->updateSegmentStatus(status);
         scheduler->updateQueryStatus(status);
         if (request->has_sender_metrics())
@@ -281,8 +294,7 @@ void PlanSegmentManagerRpcService::sendPlanSegmentStatus(
             }
         }
         // TODO(WangTao): fine grained control, conbining with retrying.
-        if (status.is_succeed)
-            scheduler->updateReceivedSegmentStatusCounter(request->query_id(), request->segment_id(), request->parallel_index());
+        scheduler->updateReceivedSegmentStatusCounter(request->query_id(), request->segment_id(), request->parallel_index(), status);
 
         if (!status.is_cancelled && status.code == 0)
         {
@@ -473,6 +485,11 @@ void PlanSegmentManagerRpcService::submitPlanSegment(
 
         execution_info.parallel_id = request->parallel_id();
         execution_info.execution_address = AddressInfo(request->execution_address());
+        if (request->has_source_task_index() && request->has_source_task_count())
+        {
+            execution_info.source_task_index = request->source_task_index();
+            execution_info.source_task_count = request->source_task_count();
+        }
         query_context->setPlanSegmentInstanceId(PlanSegmentInstanceId{request->plan_segment_id(), request->parallel_id()});
 
         /// Set client info.

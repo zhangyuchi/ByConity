@@ -1,6 +1,7 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -38,10 +39,14 @@ bool Scheduler::getBatchTaskToSchedule(BatchTaskPtr & task)
 
 void Scheduler::dispatchTask(PlanSegment * plan_segment_ptr, const SegmentTask & task, const size_t idx)
 {
-    const auto & selector_info = node_selector_result[task.task_id];
-    const auto & worker_node = selector_info.worker_nodes[idx];
-    PlanSegmentExecutionInfo execution_info;
-    execution_info.parallel_id = idx;
+    WorkerNode worker_node;
+    NodeSelectorResult selector_info;
+    {
+        std::unique_lock<std::mutex> lock(node_selector_result_mutex);
+        selector_info = node_selector_result[task.task_id];
+        worker_node = selector_info.worker_nodes[idx];
+    }
+    PlanSegmentExecutionInfo execution_info = generateExecutionInfo(task.task_id, idx);
     std::shared_ptr<butil::IOBuf> plan_segment_buf_ptr;
     {
         std::unique_lock<std::mutex> lk(segment_bufs_mutex);
@@ -67,22 +72,29 @@ void Scheduler::dispatchTask(PlanSegment * plan_segment_ptr, const SegmentTask &
     if (const auto & id_to_addr_iter = dag_graph_ptr->id_to_address.find(task.task_id);
         id_to_addr_iter != dag_graph_ptr->id_to_address.end())
     {
-        id_to_addr_iter->second.push_back(worker_node.address);
+        id_to_addr_iter->second.at(idx) = worker_node.address;
     }
     else
     {
-        dag_graph_ptr->id_to_address.emplace(task.task_id, AddressInfos{worker_node.address});
+        AddressInfos infos(selector_info.worker_nodes.size());
+        dag_graph_ptr->id_to_address.emplace(task.task_id, std::move(infos));
+        dag_graph_ptr->id_to_address[task.task_id].at(idx) = worker_node.address;
     }
 }
 
 TaskResult Scheduler::scheduleTask(PlanSegment * plan_segment_ptr, const SegmentTask & task)
 {
     TaskResult res;
-    auto selector_result = node_selector_result.emplace(task.task_id, node_selector.select(plan_segment_ptr, task.is_source));
-    auto & selector_info = selector_result.first->second;
+    sendResources(plan_segment_ptr);
+    NodeSelectorResult selector_info;
+    {
+        std::unique_lock<std::mutex> lock(node_selector_result_mutex);
+        auto selector_result = node_selector_result.emplace(task.task_id, node_selector.select(plan_segment_ptr, task.is_source));
+        selector_info = selector_result.first->second;
+    }
     prepareTask(plan_segment_ptr, selector_info.worker_nodes.size());
     dag_graph_ptr->scheduled_segments.emplace(task.task_id);
-    dag_graph_ptr->segment_paralle_size_map[task.task_id] = selector_info.worker_nodes.size();
+    dag_graph_ptr->segment_parallel_size_map[task.task_id] = selector_info.worker_nodes.size();
 
     PlanSegmentExecutionInfo execution_info;
 
@@ -91,7 +103,7 @@ TaskResult Scheduler::scheduleTask(PlanSegment * plan_segment_ptr, const Segment
         if (auto iter = selector_info.source_addresses.find(plan_segment_input->getPlanSegmentId());
             iter != selector_info.source_addresses.end())
         {
-            plan_segment_input->insertSourceAddresses(iter->second.addresses, query_context->getSettingsRef().bsp_mode);
+            plan_segment_input->insertSourceAddresses(iter->second.addresses);
         }
     }
     std::shared_ptr<butil::IOBuf> plan_segment_buf_ptr;
@@ -209,18 +221,35 @@ void Scheduler::prepareFinalTask()
     LOG_DEBUG(log, "Set address {} for final segment", final_address_info.toString());
     final_segment->setCoordinatorAddress(final_address_info);
 
+    NodeSelectorResult selector_info;
+    if (query_context->getSettingsRef().bsp_mode)
+    {
+        bool is_source = dag_graph_ptr->sources.find(dag_graph_ptr->final) != dag_graph_ptr->sources.end();
+        auto selector_result = node_selector_result.emplace(dag_graph_ptr->final, node_selector.select(final_segment, is_source));
+        selector_info = selector_result.first->second;
+    }
+
     for (auto & plan_segment_input : final_segment->getPlanSegmentInputs())
     {
         // segment has more than one input which one is table
         if (plan_segment_input->getPlanSegmentType() != PlanSegmentType::EXCHANGE)
             continue;
-        auto address_it = dag_graph_ptr->id_to_address.find(plan_segment_input->getPlanSegmentId());
-        if (address_it == dag_graph_ptr->id_to_address.end())
-            throw Exception(
-                "Logical error: address of segment " + std::to_string(plan_segment_input->getPlanSegmentId()) + " not found",
-                ErrorCodes::LOGICAL_ERROR);
-        if (plan_segment_input->getSourceAddresses().empty())
-            plan_segment_input->insertSourceAddresses(address_it->second, query_context->getSettingsRef().bsp_mode);
+        if (query_context->getSettingsRef().bsp_mode)
+        {
+            if (auto iter = selector_info.source_addresses.find(plan_segment_input->getPlanSegmentId());
+                iter != selector_info.source_addresses.end())
+                plan_segment_input->insertSourceAddresses(iter->second.addresses);
+        }
+        else
+        {
+            auto address_it = dag_graph_ptr->id_to_address.find(plan_segment_input->getPlanSegmentId());
+            if (address_it == dag_graph_ptr->id_to_address.end())
+                throw Exception(
+                    "Logical error: address of segment " + std::to_string(plan_segment_input->getPlanSegmentId()) + " not found",
+                    ErrorCodes::LOGICAL_ERROR);
+            if (plan_segment_input->getSourceAddresses().empty())
+                plan_segment_input->insertSourceAddresses(address_it->second);
+        }
     }
     dag_graph_ptr->plan_segment_status_ptr->is_final_stage_start = true;
 }

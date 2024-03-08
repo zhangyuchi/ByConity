@@ -34,6 +34,7 @@
 #include <Optimizer/SymbolsExtractor.h>
 #include <Optimizer/Utils.h>
 #include <Optimizer/makeCastFunction.h>
+#include <Parsers/ASTPreparedStatement.h>
 #include <Parsers/ASTSelectQuery.h>
 #include <Parsers/formatAST.h>
 #include <QueryPlan/AggregatingStep.h>
@@ -103,6 +104,12 @@ public:
     RelationPlan visitASTSelectQuery(ASTPtr & node, const Void &) override;
     RelationPlan visitASTSubquery(ASTPtr & node, const Void &) override;
     RelationPlan visitASTExplainQuery(ASTPtr & node, const Void &) override;
+    RelationPlan visitASTCreatePreparedStatementQuery(ASTPtr & node, const Void &) override
+    {
+        auto & prepare = node->as<ASTCreatePreparedStatementQuery &>();
+        auto query = prepare.getQuery();
+        return process(query);
+    }
 
     RelationPlan process(ASTPtr & node) { return ASTVisitorUtil::accept(node, *this, {}); }
 
@@ -1617,7 +1624,7 @@ void QueryPlannerVisitor::planOrderBy(PlanBuilder & builder, ASTSelectQuery & se
         limit = limit_length + limit_offset;
     }
 
-    auto sorting_step = std::make_shared<SortingStep>(builder.getCurrentDataStream(), sort_description, limit, false, SortDescription{});
+    auto sorting_step = std::make_shared<SortingStep>(builder.getCurrentDataStream(), sort_description, limit, SortingStep::Stage::FULL, SortDescription{});
     builder.addStep(std::move(sorting_step));
     PRINT_PLAN(builder.plan, plan_order_by);
 }

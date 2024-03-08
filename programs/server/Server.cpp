@@ -56,6 +56,7 @@
 #include <Interpreters/ExternalLoaderXMLConfigRepository.h>
 #include <Interpreters/InterserverCredentials.h>
 #include <Interpreters/JIT/CompiledExpressionCache.h>
+#include <Interpreters/PreparedStatement/PreparedStatementManager.h>
 #include <Interpreters/ProcessList.h>
 #include <Interpreters/RuntimeFilter/RuntimeFilterService.h>
 #include <Interpreters/SQLBinding/SQLBindingCache.h>
@@ -136,7 +137,6 @@
 #include <common/logger_useful.h>
 #include <common/phdr_cache.h>
 #include <common/scope_guard.h>
-#include <Parsers/formatTenantDatabaseName.h>
 #include <Common/ChineseTokenExtractor.h>
 
 #include <CloudServices/CnchServerClientPool.h>
@@ -1792,9 +1792,6 @@ int Server::main(const std::vector<std::string> & /*args*/)
 
         global_context->setEnableSSL(enable_ssl);
 
-        bool enable_tenant_systemdb = config().getBool("enable_tenant_systemdb", true);
-        setEnableTenantSystemDB(enable_tenant_systemdb);
-
         buildLoggers(config(), logger());
 
         main_config_reloader->start();
@@ -1837,6 +1834,7 @@ int Server::main(const std::vector<std::string> & /*args*/)
             Statistics::CacheManager::initialize(global_context);
             BindingCacheManager::initializeGlobalBinding(global_context);
             PlanCacheManager::initialize(global_context);
+            PreparedStatementManager::initialize(global_context);
             Statistics::AutoStats::AutoStatisticsManager::initialize(global_context, global_context->getConfigRef());
         }
 

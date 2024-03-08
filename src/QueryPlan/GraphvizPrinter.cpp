@@ -1816,15 +1816,19 @@ String StepPrinter::printTableScanStep(const TableScanStep & step)
 
     if (step.getQueryInfo().input_order_info)
     {
-        const auto & prefix_descs = step.getQueryInfo().input_order_info->order_key_prefix_descr;
+        const auto & input_order_info = step.getQueryInfo().input_order_info;
+        details << "Input Order Info: \\n";
+        const auto & prefix_descs = input_order_info->order_key_prefix_descr;
         if (!prefix_descs.empty())
         {
-            details << "prefix desc";
+            details << "prefix desc:  \\n";
             for (const auto & desc : prefix_descs)
             {
                 details << desc.column_name << " " << desc.direction << " " << desc.nulls_direction << "\\n";
             }
         }
+        details << "direction: " << input_order_info->direction << "\\n";
+
         details << "|";
     }
 
@@ -1963,11 +1967,8 @@ String StepPrinter::printValuesStep(const ValuesStep & step)
 String StepPrinter::printLimitStep(const LimitStep & step)
 {
     std::stringstream details;
-    auto limit = step.getLimit();
-    auto offset = step.getOffset();
-    details << "Limit:" << limit << "|";
-    details << "Offset:" << offset;
-    details << "|";
+    std::visit([&](const auto & v) { details << "Limit:" << v << "|"; }, step.getLimit());
+    std::visit([&](const auto & v) { details << "Offset:" << v << "|"; }, step.getOffset());
     details << "Output\\n";
     for (const auto & column : step.getOutputStream().header)
     {
@@ -2054,9 +2055,22 @@ String StepPrinter::printSortingStep(const SortingStep & step)
         }
     }
     details << "|";
-    details << "Limit: " << step.getLimit();
-    details << "|";
-    details << "IsPartial: " << step.isPartial();
+    details << "Limit: " << step.getLimitValue();
+    if (step.getStage() == SortingStep::Stage::FULL)
+    {
+        details << "|";
+        details << "full";
+    }
+    if (step.getStage() == SortingStep::Stage::MERGE)
+    {
+        details << "|";
+        details << "merge";
+    }
+    if (step.getStage() == SortingStep::Stage::PARTIAL)
+    {
+        details << "|";
+        details << "partial";
+    }
     details << "|";
     details << "Output |";
     for (const auto & column : step.getOutputStream().header)
@@ -3321,6 +3335,12 @@ void GraphvizPrinter::appendPlanSegmentNode(std::stringstream & out, const PlanS
         {
             out << col.name << " ";
         }
+
+        if (input->needKeepOrder())
+        {
+            out << "keeporder ";
+        }
+
         out << "\n";
     }
     out << "\n";
@@ -3332,6 +3352,10 @@ void GraphvizPrinter::appendPlanSegmentNode(std::stringstream & out, const PlanS
         for (const auto & col : input->getHeader())
         {
             out << col.name << " ";
+        }
+        if (input->needKeepOrder())
+        {
+            out << "keeporder ";
         }
         out << "\n";
     }

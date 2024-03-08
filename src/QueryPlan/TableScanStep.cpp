@@ -27,6 +27,8 @@
 #include <Interpreters/evaluateConstantExpression.h>
 #include <Interpreters/misc.h>
 #include <MergeTreeCommon/CnchBucketTableCommon.h>
+#include <MergeTreeCommon/MergeTreeMetaBase.h>
+#include <MergeTreeCommon/assignCnchParts.h>
 #include <Optimizer/PredicateUtils.h>
 #include <Optimizer/Rule/Rewrite/PushIntoTableScanRules.h>
 #include <Optimizer/RuntimeFilterUtils.h>
@@ -49,17 +51,17 @@
 #include <QueryPlan/QueryPlan.h>
 #include <QueryPlan/planning_common.h>
 #include <Storages/IStorage_fwd.h>
+#include <Storages/MergeTree/Index/BitmapIndexHelper.h>
+#include <Storages/MergeTree/Index/TableScanExecutorWithIndex.h>
 #include <Storages/MergeTree/MergeTreeWhereOptimizer.h>
 #include <Storages/RemoteFile/IStorageCnchFile.h>
-#include <Storages/MergeTree/Index/TableScanExecutorWithIndex.h>
-#include <Storages/VirtualColumnUtils.h>
 #include <Storages/StorageCloudMergeTree.h>
 #include <Storages/StorageReplicatedMergeTree.h>
+#include <Storages/VirtualColumnUtils.h>
 #include <fmt/format.h>
 #include <Common/FieldVisitorToString.h>
 #include "Interpreters/DatabaseCatalog.h"
 #include <Common/Stopwatch.h>
-#include <Interpreters/RuntimeFilter/RuntimeFilterManager.h>
 
 namespace DB
 {
@@ -229,7 +231,7 @@ class TableScanExecutor
 {
 public:
     TableScanExecutor(TableScanStep & step, const MergeTreeMetaBase & storage_, ContextPtr context_);
-    ExecutePlan buildExecutePlan();
+    ExecutePlan buildExecutePlan(const DistributedPipelineSettings & distributed_settings);
 
 private:
     bool match(ProjectionMatchContext & candidate) const;
@@ -343,7 +345,7 @@ TableScanExecutor::TableScanExecutor(TableScanStep & step, const MergeTreeMetaBa
     match_projection = true;
 }
 
-ExecutePlan TableScanExecutor::buildExecutePlan()
+ExecutePlan TableScanExecutor::buildExecutePlan(const DistributedPipelineSettings & distributed_settings)
 {
     if (!match_projection)
         return {};
@@ -351,6 +353,15 @@ ExecutePlan TableScanExecutor::buildExecutePlan()
     PartGroups part_groups;
     {
         auto parts = storage.getDataPartsVector();
+        if (distributed_settings.source_task_index && distributed_settings.source_task_count)
+        {
+            LOG_TRACE(
+                log,
+                "Filter the data parts with index {} count {}",
+                distributed_settings.source_task_index.value(),
+                distributed_settings.source_task_count.value());
+            filterParts(parts, distributed_settings.source_task_index.value(), distributed_settings.source_task_count.value());
+        }
         parts.erase(std::remove_if(parts.begin(), parts.end(), [](auto & part) { return part->info.isFakeDropRangePart(); }), parts.end());
 
         LOG_DEBUG(log, "Num of parts before part pruning: {}", std::to_string(parts.size()));
@@ -1069,8 +1080,10 @@ void TableScanStep::initializePipeline(QueryPipeline & pipeline, const BuildQuer
         partition_filter = query_info.partition_filter->clone();
     auto interpreter = std::make_shared<InterpreterSelectQuery>(query_info.query, build_context.context, options);
     interpreter->execute(true);
+    auto backup_input_order_info = query_info.input_order_info;
     query_info = interpreter->getQueryInfo();
     query_info = fillQueryInfo(build_context.context);
+    query_info.input_order_info = backup_input_order_info;
     LOG_DEBUG(log, "init pipeline stage run time: make up query info, {} ms", stage_watch.elapsedMillisecondsAsDouble());
 
     // always do filter underneath, as WHERE filter won't reuse PREWHERE result in optimizer mode
@@ -1124,9 +1137,10 @@ void TableScanStep::initializePipeline(QueryPipeline & pipeline, const BuildQuer
 
     stage_watch.restart();
     if (use_optimizer_projection_selection)
-        execute_plan = TableScanExecutor(*this, *merge_tree_storage, build_context.context).buildExecutePlan();
+        execute_plan
+            = TableScanExecutor(*this, *merge_tree_storage, build_context.context).buildExecutePlan(build_context.distributed_settings);
     else if (use_projection_index)
-        execute_plan = TableScanExecutorWithIndex(*this, build_context.context).buildExecutePlan();
+        execute_plan = TableScanExecutorWithIndex(*this, build_context.context).buildExecutePlan(build_context.distributed_settings);
     LOG_DEBUG(log, "init pipeline stage run time: projection match, {} ms", stage_watch.elapsedMillisecondsAsDouble());
 
     size_t max_streams = build_context.context->getSettingsRef().max_threads;
@@ -1139,6 +1153,14 @@ void TableScanStep::initializePipeline(QueryPipeline & pipeline, const BuildQuer
     if (execute_plan.empty())
     {
         auto storage_snapshot = storage->getStorageSnapshot(storage->getInMemoryMetadataPtr(), build_context.context);
+        if (auto * cloud_merge_tree = dynamic_cast<MergeTreeMetaBase *>(storage.get()))
+        {
+            if (build_context.distributed_settings.source_task_index)
+            {
+                cloud_merge_tree->source_index = build_context.distributed_settings.source_task_index;
+                cloud_merge_tree->source_count = build_context.distributed_settings.source_task_count;
+            }
+        }
         auto pipe = storage->read(
             interpreter->getRequiredColumns(), storage_snapshot, query_info, build_context.context, QueryProcessingStage::Enum::FetchColumns, max_block_size, max_streams);
 
@@ -1395,7 +1417,8 @@ void TableScanStep::initializePipeline(QueryPipeline & pipeline, const BuildQuer
     if (!pipes.empty())
     {
         pipe = Pipe::unitePipes(std::move(pipes));
-        pipe.resize(1);
+        if (pushdown_aggregation)
+            pipe.resize(1);
     }
     else
     {
@@ -1497,12 +1520,14 @@ std::shared_ptr<TableScanStep> TableScanStep::fromProto(const Protos::TableScanS
     return step;
 }
 
-std::shared_ptr<IQueryPlanStep> TableScanStep::copy(ContextPtr /*context*/) const
+std::shared_ptr<IQueryPlanStep> TableScanStep::copy(ContextPtr) const
 {
     SelectQueryInfo copy_query_info = query_info; // fixme@kaixi: deep copy here
     copy_query_info.query = query_info.query->clone();
-    auto new_prewhere = copy_query_info.query->as<ASTSelectQuery &>().prewhere();
-
+    if (query_info.partition_filter)
+        copy_query_info.partition_filter = query_info.partition_filter->clone();
+    if (query_info.input_order_info)
+        copy_query_info.input_order_info = std::make_shared<InputOrderInfo>(*query_info.input_order_info);
     return std::make_unique<TableScanStep>(
         output_stream.value(),
         storage,
@@ -1774,7 +1799,7 @@ Names TableScanStep::getRequiredColumns(GetFlags flags) const
         for (const auto & item : inline_expressions)
         {
             const auto * func = item.second->as<ASTFunction>();
-            if (func && Poco::toLower(func->name) == "arraysetcheck")
+            if (func && functionCanUseBitmapIndex(*func))
                 add_columns_in_expr(item.second);
         }
     }
@@ -1812,5 +1837,22 @@ NameToNameMap TableScanStep::getAliasToColumnMap() const
     for (const auto & column_to_alias : column_alias)
         ret.emplace(column_to_alias.second, column_to_alias.first);
     return ret;
+}
+
+void TableScanStep::prepare(const PreparedStatementContext & prepared_context)
+{
+    prepared_context.prepare(query_info.partition_filter);
+    prepared_context.prepare(query_info.query);
+}
+
+bool TableScanStep::hasFunctionCanUseBitmapIndex() const
+{
+    for (const auto & item : inline_expressions)
+    {
+        const auto * func = item.second->as<ASTFunction>();
+        if (func && functionCanUseBitmapIndex(*func))
+            return true;
+    }
+    return false;
 }
 }
